@@ -1,9 +1,9 @@
 **Retail Data Processing Hackathon — Loyalty Lens Use Case**
-1. Vision
+**1. Vision**
 
 Build an automated, reliable data ingestion and quality pipeline that transforms raw retail transactions into clean analytical tables enabling loyalty point accrual, RFM segmentation, High-Spender / At-Risk detection, and CLV Potential scoring.
 
-2. Architecture Overview
+**2. Architecture Overview**
 End-to-End Data Flow
 
 Source CSV Files → Raw Landing Zone
@@ -18,12 +18,12 @@ Segmentation & Scoring → RFM, High-Spender, At-Risk, CLV Potential
 
 Serving Layer (Metabase / Superset) → Dashboards & Insights
 
-3. ER Diagram
+**3. ER Diagram**
 
 <img width="3680" height="2582" alt="Untitled diagram-2025-11-18-083401" src="https://github.com/user-attachments/assets/11149e67-fd4b-4c8b-a81f-d3388bb2ea31" />
 
 
-4. Data Model Summary
+**4. Data Model Summary**
 customers
 
 Stores basic customer information and identifies loyalty program members.
@@ -56,7 +56,7 @@ bad_records
 
 Logs failed rows from ingestion or quality checks.
 
-5. Data Pipeline Components
+**5. Data Pipeline Components**
 Ingestion
 
 Airbyte / Python scripts load CSVs into raw_* tables.
@@ -87,7 +87,7 @@ Build fact & dimension tables.
 
 Compute loyalty points.
 
-6. Loyalty Points Logic
+**6. Loyalty Points Logic**
 
 Rule Example: 1 point per ₹10 spent.
 
@@ -97,7 +97,7 @@ Update loyalty_accounts with atomic upsert.
 
 Insert an audit entry into loyalty_ledger.
 
-7. Segmentation
+**7. Segmentation**
 RFM Metrics
 
 Recency: days since last transaction
@@ -112,7 +112,7 @@ High-Spenders: Top 10% monetary value
 
 At-Risk: No purchase in 30+ days + positive points balance
 
-8. CLV Potential Scoring (Optional Enhancement)
+**8. CLV Potential Scoring (Optional Enhancement)**
 
 Features:
 
@@ -126,7 +126,7 @@ Points Balance
 
 Produces a 0–100 potential score ranking customers by future value.
 
-9. Technology Stack
+**9. Technology Stack**
 
 Ingestion: Airbyte (free) or Fivetran (paid)
 
@@ -140,7 +140,7 @@ Analytics: Metabase / Superset (free), Tableau / Looker (paid)
 
 ML: scikit-learn, Python notebooks
 
-10. Summary
+**10. Summary**
 
 This design ensures:
 
