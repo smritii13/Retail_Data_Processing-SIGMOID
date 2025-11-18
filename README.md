@@ -19,13 +19,10 @@ Segmentation & Scoring → RFM, High-Spender, At-Risk, CLV Potential
 Serving Layer (Metabase / Superset) → Dashboards & Insights
 
 3. ER Diagram
-erDiagram
-    CUSTOMERS ||--o{ TRANSACTIONS : places
-    TRANSACTIONS ||--o{ TRANSACTION_ITEMS : contains
-    PRODUCTS ||--o{ TRANSACTION_ITEMS : referenced_in
-    CUSTOMERS ||--|| LOYALTY_ACCOUNTS : has
-    CUSTOMERS ||--o{ CUSTOMER_SEGMENTS : assigned
-    RAW_FILES ||--o{ BAD_RECORDS : produces
+
+<img width="3680" height="2582" alt="Untitled diagram-2025-11-18-083401" src="https://github.com/user-attachments/assets/11149e67-fd4b-4c8b-a81f-d3388bb2ea31" />
+
+
 4. Data Model Summary
 customers
 
