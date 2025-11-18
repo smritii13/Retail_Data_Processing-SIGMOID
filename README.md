@@ -17,7 +17,7 @@ Transform Layer (SQL) → customers, transactions, transaction_items, loyalty_ac
 
 Segmentation & Scoring → RFM, High-Spender, At-Risk, CLV Potential
 
-Serving Layer (Metabase / Superset) → Dashboards & Insights
+Serving Layer → Dashboards & Insights
 
 **3. ER Diagram**
 
