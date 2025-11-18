@@ -1,4 +1,4 @@
-#Retail Data Processing Hackathon — Loyalty Lens Use Case
+**Retail Data Processing Hackathon — Loyalty Lens Use Case**
 
 1. Vision
 
