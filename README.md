@@ -25,42 +25,42 @@ Serving Layer (Metabase / Superset) → Dashboards & Insights
 
 
 **4. Data Model Summary**
-customers
+_**customers**_
 
 Stores basic customer information and identifies loyalty program members.
 
-transactions
+_**transactions**_
 
 One row per retail purchase; linked to customers.
 
-transaction_items
+_**transaction_items**_
 
 Line-level product information per transaction.
 
-products
+_**products**_
 
 Product catalog for diversity/breadth scoring.
 
-loyalty_accounts
+_**loyalty_accounts**_
 
 Tracks loyalty points, tiers, and updates.
 
-customer_segments
+_**customer_segments**_
 
 Stores RFM-based and behavior-based segments.
 
-new_customer
+_**new_customer**_
 
 Captures unidentified spends for future marketing follow-up.
 
-bad_records
+_**bad_records**_
 
 Logs failed rows from ingestion or quality checks.
 
 **5. Data Pipeline Components**
 Ingestion
 
-Airbyte / Python scripts load CSVs into raw_* tables.
+Python scripts load CSVs into raw  tables.
 
 Logs metadata such as file source, ingestion time.
 
