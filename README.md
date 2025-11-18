@@ -9,7 +9,7 @@ End-to-End Data Flow
 
 Source CSV Files → Raw Landing Zone
 
-Ingestion Layer (Airbyte / Python ETL) → raw_* tables
+Ingestion Layer (Python ETL) → raw  tables
 
 Data Quality Validation (Great Expectations) → Clean vs. bad_records
 
