@@ -13,7 +13,7 @@ Ingestion Layer (Python ETL) → raw  tables
 
 Data Quality Validation (Great Expectations) → Clean vs. bad_records
 
-Transform Layer (SQL/dbt) → customers, transactions, transaction_items, loyalty_accounts
+Transform Layer (SQL) → customers, transactions, transaction_items, loyalty_accounts
 
 Segmentation & Scoring → RFM, High-Spender, At-Risk, CLV Potential
 
@@ -25,6 +25,7 @@ Serving Layer (Metabase / Superset) → Dashboards & Insights
 
 
 **4. Data Model Summary**
+
 _**customers**_
 
 Stores basic customer information and identifies loyalty program members.
