@@ -1,33 +1,32 @@
-# Colab-ready universal EDA + mandatory standardize / dedupe / normalize pipeline
-# Copy-paste entire cell into Google Colab and run.
-# Installs deps, loads dataset (tries /mnt/data/retail_data_Source.csv), runs EDA + preprocessing,
-# saves results and preprocess pipeline to /content/eda_output_<ts>/ and zips it.
-
-!pip install -q pandas numpy matplotlib seaborn scipy scikit-learn statsmodels joblib
+# Colab-ready pipeline: dedupe, null-handling, regex validation, outlier removal, dtype downcast,
+# unsupervised feature selection (low variance + high-corr), encode + normalize, save artifacts (NO PLOTS, NO VIF)
+!pip install -q pandas numpy scipy scikit-learn joblib
 
 import os, sys, json, shutil, re
 from datetime import datetime
 import pandas as pd, numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-sns.set(style="whitegrid", rc={"figure.figsize": (8,5)})
 import warnings
 warnings.filterwarnings("ignore")
 
-# sklearn
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MinMaxScaler, StandardScaler, LabelEncoder
+from sklearn.feature_selection import VarianceThreshold
 import joblib
 
-# statsmodels for VIF (optional)
-try:
-    from statsmodels.stats.outliers_influence import variance_inflation_factor
-except Exception:
-    variance_inflation_factor = None
+# --------------------------
+# CONFIG (tweak these)
+# --------------------------
+COL_MISSING_THRESH_COL_DROP = 0.5     # drop columns with >50% missing
+ROW_MISSING_THRESH_DROP = 0.5         # drop rows with >50% missing
+SAMPLE_FOR_TYPE_INFERENCE = 500
+EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+OUTLIER_IQR_K = 1.5                   # IQR multiplier for outlier detection (1.5 standard)
+LOW_VARIANCE_THRESHOLD = 0.0          # variance threshold (0 removes constant cols)
+CORR_THRESHOLD = 0.95                 # if absolute corr > this, drop one of the pair
+DOWNCAST_INTS = True
+DOWNCAST_FLOATS = True
 
 # --------------------------
-# Helpers: load data (auto)
+# Utilities: load / outdir
 # --------------------------
 def load_data_auto(preferred_path="/mnt/data/retail_data_Source.csv", sheet_name=None):
     from google.colab import files
@@ -54,18 +53,11 @@ def load_data_auto(preferred_path="/mnt/data/retail_data_Source.csv", sheet_name
         try:
             return pd.read_json(path, lines=True)
         except:
-            return pd.read_json(path, lines=False)
+            return pd.read_json(path)
     if ext == ".parquet":
         return pd.read_parquet(path)
-    # fallback
-    try:
-        return pd.read_csv(path, low_memory=False)
-    except Exception as e:
-        raise ValueError(f"Unable to read file {path}: {e}")
+    return pd.read_csv(path, low_memory=False)
 
-# --------------------------
-# Output directory
-# --------------------------
 def make_output_dir(base_name="eda_output"):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out = f"/content/{base_name}_{ts}"
@@ -73,281 +65,266 @@ def make_output_dir(base_name="eda_output"):
     return out
 
 # --------------------------
-# Standardize column names
+# Name standardization
 # --------------------------
 def standardize_column_names(df):
-    def clean(name):
-        if not isinstance(name, str):
-            name = str(name)
-        name = name.strip().lower()
-        # replace spaces and special chars with underscore
-        name = re.sub(r'[^0-9a-z]+', '_', name)
-        name = re.sub(r'_+', '_', name).strip('_')
-        return name
-    new_cols = [clean(c) for c in df.columns]
-    df.columns = new_cols
+    df.columns = [re.sub(r'[^0-9a-z]+','_', str(c).strip().lower()).strip('_') for c in df.columns]
     return df
 
 # --------------------------
-# Smart deduplication
+# Detect date/time/email columns
 # --------------------------
-def smart_deduplicate(df):
-    # heuristics: look for id-like columns
-    id_like = [c for c in df.columns if re.search(r'id$|^id$|invoice|order_no|order|orderid|transaction', c)]
-    if id_like:
-        # choose the first id-like column which has duplicates if any
-        for col in id_like:
-            if df[col].notna().sum() > 0:
-                before = df.shape[0]
-                df = df.drop_duplicates(subset=[col], keep='first')
-                method = f"dedup_by_{col}"
-                after = df.shape[0]
-                return df, method, before-after
-    # fallback: exact-row duplicates
+def detect_special_columns(df):
+    date_cols=[]; time_cols=[]; email_cols=[]
+    for c in df.columns:
+        lc = c.lower()
+        if re.search(r'date|dob|day|timestamp|created_at|order_date', lc): date_cols.append(c)
+        if re.search(r'time|sec|hour|min|duration', lc): time_cols.append(c)
+        if re.search(r'email|e_mail|mail', lc): email_cols.append(c)
+    # content-based
+    for c in df.columns:
+        if c in date_cols+time_cols+email_cols: continue
+        sample = df[c].dropna().astype(str).head(SAMPLE_FOR_TYPE_INFERENCE).tolist()
+        if not sample: continue
+        if sum(1 for v in sample if re.search(r'\d{1,4}[-/ ]\d{1,2}[-/ ]\d{1,4}', v))/len(sample) > 0.6:
+            date_cols.append(c); continue
+        if sum(1 for v in sample if re.search(r'\d{1,2}:\d{2}', v))/len(sample) > 0.6:
+            time_cols.append(c); continue
+        if sum(1 for v in sample if EMAIL_REGEX.match(v.strip()))/len(sample) > 0.6:
+            email_cols.append(c); continue
+    return sorted(set(date_cols)), sorted(set(time_cols)), sorted(set(email_cols))
+
+# --------------------------
+# Dedupe (drop duplicates immediately)
+# --------------------------
+def smart_deduplicate_drop(df, outdir):
     before = df.shape[0]
-    df = df.drop_duplicates(keep='first')
-    after = df.shape[0]
-    if after < before:
-        return df, "dedup_by_exact_rows", before-after
-    else:
-        return df, "no_duplicates_found", 0
+    df = df.drop_duplicates(keep='first').reset_index(drop=True)
+    removed = before - df.shape[0]
+    id_like = [c for c in df.columns if re.search(r'\b(id|order|invoice|transaction|order_no|orderid)\b', c)]
+    for c in id_like:
+        if c in df.columns:
+            b = df.shape[0]
+            df = df.drop_duplicates(subset=[c], keep='first').reset_index(drop=True)
+            removed += (b - df.shape[0])
+    with open(os.path.join(outdir, "dedup_method.txt"), "w") as f:
+        f.write(f"rows_removed:{removed}\nid_like_cols:{id_like}")
+    return df, removed
 
 # --------------------------
-# Preprocessing: standardize strings, handle missing, encode categories, scale numbers
+# Null handling (drop cols, impute, drop rows)
 # --------------------------
-def preprocess_and_save_pipeline(df, outdir, mandatory_standardize=True, mandatory_normalize=True):
-    # 1. Standardize column names (already done upstream)
-    # 2. Trim string columns, fill NA for categorical
-    cat_cols = df.select_dtypes(include=['object','category']).columns.tolist()
+def handle_nulls(df, outdir):
+    miss_frac = df.isnull().mean()
+    cols_to_drop = miss_frac[miss_frac > COL_MISSING_THRESH_COL_DROP].index.tolist()
+    df = df.drop(columns=cols_to_drop)
+    # numeric -> median
+    for c in df.select_dtypes(include=[np.number]).columns:
+        if df[c].isnull().any():
+            df[c] = df[c].fillna(df[c].median())
+    # object -> mode or placeholder
+    for c in df.select_dtypes(include=['object','category']).columns:
+        if df[c].isnull().any():
+            mode = df[c].mode(dropna=True)
+            fill = mode.iloc[0] if not mode.empty else "<<MISSING>>"
+            df[c] = df[c].fillna(fill)
+    # drop rows with too many missing
+    row_miss_frac = df.isnull().mean(axis=1)
+    before = df.shape[0]
+    df = df.loc[row_miss_frac <= ROW_MISSING_THRESH_DROP].reset_index(drop=True)
+    rows_dropped = before - df.shape[0]
+    with open(os.path.join(outdir,"null_handling.txt"), "w") as f:
+        f.write(json.dumps({"cols_dropped":cols_to_drop, "rows_dropped":rows_dropped}, indent=2))
+    return df, cols_to_drop, rows_dropped
+
+# --------------------------
+# Validate/fix email, date, time columns
+# --------------------------
+def validate_and_fix_special_cols(df, date_cols, time_cols, email_cols, outdir):
+    issues = {"email":{}, "date":{}, "time":{}}
+    for c in email_cols:
+        if c not in df.columns: continue
+        valid = df[c].astype(str).apply(lambda x: bool(EMAIL_REGEX.match(str(x).strip())) if str(x).strip().lower()!='nan' else False)
+        df[c + "_email_valid"] = valid
+        issues["email"][c] = int((~valid).sum())
+        df.loc[~valid, c] = np.nan
+    for c in date_cols:
+        if c not in df.columns: continue
+        parsed = pd.to_datetime(df[c], errors='coerce', infer_datetime_format=True)
+        # try dayfirst if many NaT
+        nat_frac = parsed.isna().mean()
+        if nat_frac > 0.4:
+            parsed_try = pd.to_datetime(df[c], errors='coerce', dayfirst=True, infer_datetime_format=True)
+            if parsed_try.isna().mean() < nat_frac:
+                parsed = parsed_try
+        df[c + "_dt"] = parsed
+        df[c + "_date_valid"] = parsed.notna()
+        issues["date"][c] = int(parsed.isna().sum())
+        df.loc[parsed.isna(), c] = np.nan
+    for c in time_cols:
+        if c not in df.columns: continue
+        parsed = pd.to_datetime(df[c], errors='coerce', infer_datetime_format=True)
+        parsed_time = parsed.dt.time
+        df[c + "_time_parsed"] = parsed_time
+        df[c + "_time_valid"] = parsed_time.notna()
+        issues["time"][c] = int(parsed_time.isna().sum())
+        df.loc[pd.isna(parsed_time), c] = np.nan
+    with open(os.path.join(outdir,"special_column_issues.json"), "w") as f:
+        json.dump(issues, f, indent=2)
+    return df, issues
+
+# --------------------------
+# Outlier detection & removal (IQR method) — removes rows with any numeric column outlier
+# --------------------------
+def remove_outliers_iqr(df, outdir, k=OUTLIER_IQR_K):
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not num_cols:
+        with open(os.path.join(outdir,"outlier_removal.txt"), "w") as f:
+            f.write("No numeric columns to check for outliers.")
+        return df, 0
+    lows = df[num_cols].quantile(0.25)
+    highs = df[num_cols].quantile(0.75)
+    iqr = highs - lows
+    lower_bound = lows - k * iqr
+    upper_bound = highs + k * iqr
+    # boolean mask: True for rows that are NOT outliers for all columns
+    mask = pd.Series(True, index=df.index)
+    for c in num_cols:
+        # skip zero-IQR columns
+        if iqr[c] == 0 or pd.isna(iqr[c]):
+            continue
+        mask = mask & (df[c] >= lower_bound[c]) & (df[c] <= upper_bound[c])
+    before = df.shape[0]
+    df_clean = df.loc[mask].reset_index(drop=True)
+    removed = before - df_clean.shape[0]
+    with open(os.path.join(outdir, "outlier_removal.txt"), "w") as f:
+        f.write(json.dumps({"method":"IQR", "k":k, "rows_before":before, "rows_after":df_clean.shape[0], "rows_removed":removed}, indent=2))
+    return df_clean, int(removed)
 
-    # Convert boolean to numeric if present
-    bool_cols = df.select_dtypes(include=['bool']).columns.tolist()
-    # Keep record of original numeric cols
-    orig_num_cols = num_cols.copy()
+# --------------------------
+# Data type downcast to save memory
+# --------------------------
+def downcast_dtypes(df, outdir, down_ints=DOWNCAST_INTS, down_floats=DOWNCAST_FLOATS):
+    original_memory = df.memory_usage(deep=True).sum()
+    for c in df.columns:
+        col = df[c]
+        if down_ints and pd.api.types.is_integer_dtype(col):
+            df[c] = pd.to_numeric(col, downcast='integer')
+        if down_floats and pd.api.types.is_float_dtype(col):
+            df[c] = pd.to_numeric(col, downcast='float')
+    new_memory = df.memory_usage(deep=True).sum()
+    with open(os.path.join(outdir, "dtype_downcast_log.txt"), "w") as f:
+        f.write(json.dumps({"memory_before":int(original_memory), "memory_after":int(new_memory), "bytes_saved":int(original_memory-new_memory)}, indent=2))
+    return df
 
-    # apply trimming on object columns
-    for c in cat_cols:
+# --------------------------
+# Feature selection (unsupervised): low variance + high correlation pruning
+# --------------------------
+def feature_selection_unsupervised(df, outdir, var_thresh=LOW_VARIANCE_THRESHOLD, corr_thresh=CORR_THRESHOLD):
+    # Work only on numeric features for variance & correlation selection
+    num = df.select_dtypes(include=[np.number]).copy()
+    removed = {"low_variance": [], "high_correlation": []}
+
+    # 1) Low variance removal (VarianceThreshold)
+    if num.shape[1] > 0:
+        vt = VarianceThreshold(threshold=var_thresh)
         try:
-            df[c] = df[c].astype(str).str.strip().replace({'nan':'<<MISSING>>'}).fillna("<<MISSING>>")
+            vt.fit(num.fillna(0))
+            support = vt.get_support(indices=True)
+            kept_cols = [num.columns[i] for i in support]
+            low_var_cols = [c for c in num.columns if c not in kept_cols]
+            removed["low_variance"].extend(low_var_cols)
+            df = df.drop(columns=low_var_cols, errors='ignore')
         except Exception:
-            df[c] = df[c].fillna("<<MISSING>>").astype(str)
+            # fallback no-op
+            pass
 
-    # handle bool -> int
-    for c in bool_cols:
-        df[c] = df[c].astype(int)
-        if c not in num_cols:
-            num_cols.append(c)
+    # 2) High correlation pruning (absolute corr)
+    num = df.select_dtypes(include=[np.number]).copy()
+    if num.shape[1] > 1:
+        corr = num.corr().abs()
+        # upper triangle
+        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        to_drop = set()
+        for col in upper.columns:
+            high_corr_cols = upper.index[upper[col] > corr_thresh].tolist()
+            for rc in high_corr_cols:
+                # choose to drop the column with higher mean absolute correlation
+                mean_corr_col = corr[col].drop(col).mean()
+                mean_corr_rc = corr[rc].drop(rc).mean()
+                drop_col = col if mean_corr_col >= mean_corr_rc else rc
+                to_drop.add(drop_col)
+        removed["high_correlation"].extend(sorted(list(to_drop)))
+        df = df.drop(columns=list(to_drop), errors='ignore')
 
-    # Re-evaluate numeric columns in case some numeric-like object columns exist
-    # try to coerce object columns to numeric where feasible (no editing required later)
-    coerced = []
-    for c in cat_cols:
-        # if many values look numeric, coerce
-        sample = df[c].dropna().astype(str).head(500).tolist()
-        numeric_like = sum(1 for v in sample if re.fullmatch(r'[-+]?\d+(\.\d+)?', v)) / max(1, len(sample))
+    with open(os.path.join(outdir, "feature_selection_removed.json"), "w") as f:
+        json.dump(removed, f, indent=2)
+
+    return df, removed
+
+# --------------------------
+# Preprocess: standardize strings, encode categories, normalize numbers
+# --------------------------
+def preprocess_and_save_pipeline(df, outdir, mandatory_normalize=True):
+    # Trim strings
+    for c in df.select_dtypes(include=['object','category']).columns:
+        df[c] = df[c].astype(str).str.strip().replace({'nan':'<<MISSING>>'}).fillna("<<MISSING>>")
+
+    # convert numeric-like strings to numeric where it makes sense
+    for c in df.select_dtypes(include=['object']).columns:
+        sample = df[c].dropna().astype(str).head(200).tolist()
+        if not sample: continue
+        numeric_like = sum(1 for v in sample if re.fullmatch(r'[-+]?\d+(\.\d+)?', v)) / len(sample)
         if numeric_like > 0.8:
             df[c] = pd.to_numeric(df[c], errors='coerce')
-            coerced.append(c)
-    # update lists
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
     cat_cols = df.select_dtypes(include=['object','category']).columns.tolist()
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
-    # 3. Build transformers
-    # For numeric: produce MinMax and Standard (zscore). We'll save transformed copies; we will not overwrite original numeric columns.
-    numeric_transformer_mm = MinMaxScaler()
-    numeric_transformer_std = StandardScaler()
-
-    # For categorical: LabelEncoder per column (save mapping)
+    # Label encode categories
     label_encoders = {}
     for c in cat_cols:
         le = LabelEncoder()
-        # LabelEncoder cannot fit on NaN-like; fill with placeholder
         df[c] = df[c].fillna("<<MISSING>>").astype(str)
         try:
-            le.fit(df[c].astype(str))
+            le.fit(df[c])
+            df[c + "_le"] = le.transform(df[c])
             label_encoders[c] = le
         except Exception:
-            # fallback: map unique to integers
-            uniques = list(pd.Series(df[c].astype(str).unique()))
-            mapping = {v:i for i,v in enumerate(uniques)}
-            # create a simple encoder-like object
-            class SimpleLE:
-                def __init__(self,mapping): self.mapping=mapping
-                def transform(self, arr): return [self.mapping.get(str(x), -1) for x in arr]
-                def fit(self, arr): pass
-            label_encoders[c] = SimpleLE(mapping)
-    # Fit numeric scalers on numeric columns
-    X_num = df[num_cols].fillna(0).values if num_cols else np.empty((len(df),0))
-    if mandatory_normalize and len(num_cols)>0:
-        numeric_transformer_mm.fit(X_num)
-        numeric_transformer_std.fit(X_num)
+            df[c + "_le"] = pd.factorize(df[c])[0]
 
-    # 4. Apply transforms and save new columns
-    # Create copies in df_out to avoid destructive changes
-    df_out = df.copy()
+    # Scale numeric columns (minmax + zscore)
+    mm = MinMaxScaler()
+    ss = StandardScaler()
+    if num_cols:
+        X = df[num_cols].fillna(0).values
+        mm.fit(X)
+        ss.fit(X)
+        for c in num_cols:
+            arr = df[[c]].fillna(0).values
+            try:
+                df[c + "_minmax"] = mm.transform(arr).reshape(-1,)
+                df[c + "_zsc"] = ss.transform(arr).reshape(-1,)
+            except Exception:
+                pass
 
-    # Add normalized columns: suffixes _minmax and _zsc
-    for i, col in enumerate(num_cols):
+    # Save pipeline artifact
+    artifact = {"numeric_columns": num_cols, "categorical_columns": cat_cols, "minmax_scaler": mm, "zscore_scaler": ss, "label_encoders": label_encoders}
+    joblib.dump(artifact, os.path.join(outdir, "preprocess_pipeline.pkl"))
+
+    # Save transformed df
+    df.to_csv(os.path.join(outdir, "preprocessed_full.csv"), index=False)
+    # label mappings
+    mappings = {}
+    for k,v in label_encoders.items():
         try:
-            col_vals = df[[col]].fillna(0).values
-            if mandatory_normalize:
-                mm = numeric_transformer_mm.transform(col_vals).reshape(-1,)
-                zsc = numeric_transformer_std.transform(col_vals).reshape(-1,)
-                df_out[col + "_minmax"] = mm
-                df_out[col + "_zsc"] = zsc
-        except Exception as e:
-            print(f"Warning: scaling failed for {col}: {e}")
-
-    # Add encoded categorical columns with suffix _le
-    for c, le in label_encoders.items():
-        try:
-            df_out[c + "_le"] = le.transform(df_out[c].astype(str))
+            mappings[k] = list(map(str, v.classes_))
         except Exception:
-            # if simple object
-            df_out[c + "_le"] = pd.factorize(df_out[c].astype(str))[0]
+            mappings[k] = "<unable_to_dump_classes>"
+    with open(os.path.join(outdir, "label_mappings.json"), "w") as f:
+        json.dump(mappings, f, indent=2)
 
-    # Save preprocessing pipeline (we'll store scaler objects + label mappings in a dict)
-    preprocess_artifact = {
-        "numeric_columns": num_cols,
-        "categorical_columns": cat_cols,
-        "minmax_scaler": numeric_transformer_mm if len(num_cols)>0 else None,
-        "zscore_scaler": numeric_transformer_std if len(num_cols)>0 else None,
-        "label_encoders": label_encoders
-    }
-    # joblib can't always serialize sklearn LabelEncoder easily if custom; save pipeline with joblib (should work)
-    joblib.dump(preprocess_artifact, os.path.join(outdir, "preprocess_pipeline.pkl"))
-
-    # 5. Save transformed dataframe
-    df_out.to_csv(os.path.join(outdir, "preprocessed_full.csv"), index=False)
-    # also save original numeric-only with scaled columns for analyst convenience
-    summary_num = df_out[[c for c in df_out.columns if c.endswith("_minmax") or c.endswith("_zsc")]].copy()
-    if not summary_num.empty:
-        summary_num.to_csv(os.path.join(outdir, "numeric_transformed_preview.csv"), index=False)
-
-    # Save label encoder mappings for reference
-    le_mappings = {}
-    for c, le in label_encoders.items():
-        try:
-            if hasattr(le, "classes_"):
-                le_mappings[c] = list(map(str, le.classes_))
-            elif hasattr(le, "mapping"):
-                le_mappings[c] = le.mapping
-            else:
-                le_mappings[c] = "<unknown_encoder_type>"
-        except Exception:
-            le_mappings[c] = "<save_failed>"
-    with open(os.path.join(outdir, "label_encoder_mappings.json"), "w") as f:
-        json.dump(le_mappings, f, indent=2)
-
-    return df_out, preprocess_artifact
-
-# --------------------------
-# VIF (optional)
-# --------------------------
-def calculate_vif(df, outdir, max_features=50):
-    num = df.select_dtypes(include=[np.number]).copy()
-    if num.shape[1] < 2 or variance_inflation_factor is None:
-        return None
-    cols = num.columns.tolist()[:max_features]
-    X = num[cols].fillna(0).values
-    vif_list = []
-    for i in range(X.shape[1]):
-        try:
-            vif_val = variance_inflation_factor(X, i)
-        except Exception:
-            vif_val = None
-        vif_list.append((cols[i], float(vif_val) if vif_val is not None else None))
-    vif_df = pd.DataFrame(vif_list, columns=["feature","VIF"]).sort_values("VIF", ascending=False)
-    vif_df.to_csv(os.path.join(outdir, "vif.csv"), index=False)
-    return vif_df
-
-# --------------------------
-# EDA elements: missing, univariate, bivariate
-# --------------------------
-def save_basic_info(df, outdir):
-    info = {
-        "shape": df.shape,
-        "columns": df.columns.tolist(),
-        "dtypes": df.dtypes.apply(lambda x:str(x)).to_dict(),
-        "memory_bytes": int(df.memory_usage(deep=True).sum())
-    }
-    with open(os.path.join(outdir, "basic_info.json"), "w") as f:
-        json.dump(info, f, indent=2)
-    df.describe(include=[np.number]).T.to_csv(os.path.join(outdir, "describe_numeric.csv"))
-    df.describe(include=['object','category','bool']).T.to_csv(os.path.join(outdir, "describe_categorical.csv"))
-    return info
-
-def missing_and_duplicates_report(df, outdir):
-    miss = df.isnull().sum().sort_values(ascending=False)
-    miss_pct = (df.isnull().mean()*100).sort_values(ascending=False)
-    missing_df = pd.concat([miss, miss_pct], axis=1)
-    missing_df.columns = ["missing_count", "missing_percent"]
-    missing_df.to_csv(os.path.join(outdir, "missing_report.csv"))
-    # heatmap
-    try:
-        sample = df if df.shape[0] <= 2000 else df.sample(2000, random_state=1)
-        plt.figure(figsize=(12,5))
-        sns.heatmap(sample.isnull(), cbar=False)
-        plt.title("Missing values map (sampled)")
-        plt.tight_layout()
-        plt.savefig(os.path.join(outdir, "missing_heatmap.png"))
-        plt.close()
-    except Exception as e:
-        print("Warning creating missing heatmap:", e)
-    dup_count = int(df.duplicated().sum())
-    with open(os.path.join(outdir, "duplicates_count.txt"), "w") as f:
-        f.write(str(dup_count))
-    return missing_df, dup_count
-
-def univariate_plots(df, outdir, max_unique_cat=50):
-    os.makedirs(os.path.join(outdir, "univariate"), exist_ok=True)
-    for col in df.columns:
-        try:
-            ser = df[col]
-            fname = os.path.join(outdir, "univariate", f"{col}_univariate.png")
-            plt.figure(figsize=(8,4))
-            if pd.api.types.is_numeric_dtype(ser):
-                ser.dropna().hist(bins=30)
-                plt.title(f"{col} (numeric) — histogram")
-            else:
-                vc = ser.fillna("<<MISSING>>").value_counts()
-                if vc.shape[0] <= max_unique_cat:
-                    vc.plot(kind="bar")
-                    plt.title(f"{col} (categorical) — counts")
-                else:
-                    vc.head(30).plot(kind="bar")
-                    plt.title(f"{col} (categorical) — top 30 counts")
-                plt.xticks(rotation=45, ha='right')
-            plt.tight_layout()
-            plt.savefig(fname)
-            plt.close()
-        except Exception as e:
-            # ignore failures for weird columns
-            pass
-
-def bivariate_plots(df, outdir):
-    os.makedirs(os.path.join(outdir, "bivariate"), exist_ok=True)
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if len(num_cols) < 2:
-        return
-    corr = df[num_cols].corr().abs().unstack().reset_index()
-    corr.columns = ["x","y","corr"]
-    corr = corr[corr['x']!=corr['y']].sort_values("corr", ascending=False).drop_duplicates(subset=['corr'])
-    for _, row in corr.head(6).iterrows():
-        x,y = row['x'], row['y']
-        try:
-            sample = df[[x,y]].dropna()
-            if sample.shape[0] > 5000:
-                sample = sample.sample(5000, random_state=1)
-            plt.figure(figsize=(6,4))
-            sns.scatterplot(x=sample[x], y=sample[y], alpha=0.5)
-            plt.title(f"{x} vs {y} (corr={row['corr']:.2f})")
-            plt.tight_layout()
-            plt.savefig(os.path.join(outdir, "bivariate", f"{x}_vs_{y}.png"))
-            plt.close()
-        except Exception:
-            pass
+    return df, artifact
 
 # --------------------------
 # Runner
@@ -355,86 +332,75 @@ def bivariate_plots(df, outdir):
 outdir = make_output_dir()
 print("Output directory:", outdir)
 
-# Load dataset
-try:
-    df = load_data_auto(preferred_path="/mnt/data/retail_data_Source.csv")
-except Exception as e:
-    print("Auto-load failed:", e)
-    df = load_data_auto(preferred_path=None)
-
-print("Initial rows,cols:", df.shape)
+# Load data
+df = load_data_auto()
+print("Initial shape:", df.shape)
 
 # Standardize column names
 df = standardize_column_names(df)
 
-# Save head for reference
-df.head(10).to_csv(os.path.join(outdir, "head_preview.csv"), index=False)
+# Save head
+df.head(5).to_csv(os.path.join(outdir, "head_before.csv"), index=False)
 
-# Save basic info pre-processing
-save_basic_info(df, outdir)
+# Detect special columns
+date_cols, time_cols, email_cols = detect_special_columns(df)
+with open(os.path.join(outdir, "detected_special_columns.json"), "w") as f:
+    json.dump({"date_cols":date_cols, "time_cols":time_cols, "email_cols":email_cols}, f, indent=2)
+print("Detected date/time/email cols saved.")
 
-# Missing and duplicates (before dedupe)
-missing_df_before, dup_before = missing_and_duplicates_report(df, outdir)
-with open(os.path.join(outdir, "pre_dedupe_info.json"), "w") as f:
-    json.dump({"missing_top": missing_df_before.head(20).to_dict(), "duplicates": int(dup_before)}, f, indent=2)
+# Deduplicate
+df, dedup_removed = smart_deduplicate_drop(df, outdir)
+print("Duplicates removed:", dedup_removed)
 
-# Smart deduplicate
-df_deduped, dedup_method, n_removed = smart_deduplicate(df)
-with open(os.path.join(outdir, "dedup_method.txt"), "w") as f:
-    f.write(f"{dedup_method}\nremoved_rows:{int(n_removed)}\n")
-print(f"Deduplication method: {dedup_method}, rows removed: {int(n_removed)}")
+# Validate/fix special cols
+df, special_issues = validate_and_fix_special_cols(df, date_cols, time_cols, email_cols, outdir)
+print("Special columns validated.")
 
-# Save post-dedupe snapshot
-df_deduped.shape
-df_deduped.head(5).to_csv(os.path.join(outdir, "head_post_dedupe.csv"), index=False)
+# Null handling
+df, cols_dropped_missing, rows_dropped_missing = handle_nulls(df, outdir)
+print("Null handling done. cols_dropped:", cols_dropped_missing, "rows_dropped:", rows_dropped_missing)
 
-# Run mandatory preprocessing (standardize strings, categorical encode, normalize numbers)
-df_preprocessed, preprocess_artifact = preprocess_and_save_pipeline(df_deduped, outdir)
+# Outlier removal
+df, outliers_removed = remove_outliers_iqr(df, outdir, k=OUTLIER_IQR_K)
+print("Outliers removed (rows):", outliers_removed)
 
-# Save missing and dup info after preprocessing
-missing_df_after, dup_after = missing_and_duplicates_report(df_preprocessed, outdir)
-with open(os.path.join(outdir, "post_processing_info.json"), "w") as f:
-    json.dump({
-        "missing_top": missing_df_after.head(20).to_dict(),
-        "duplicates_after": int(dup_after),
-        "preprocess_numeric_cols": preprocess_artifact.get("numeric_columns"),
-        "preprocess_categorical_cols": preprocess_artifact.get("categorical_columns")
-    }, f, indent=2)
+# Downcast dtypes
+df = downcast_dtypes(df, outdir)
+print("Dtypes downcasted where possible. New memory info in dtype_downcast_log.txt")
 
-# EDA plots
-univariate_plots(df_preprocessed, outdir)
-bivariate_plots(df_preprocessed, outdir)
+# Feature selection (unsupervised)
+df, removed_features = feature_selection_unsupervised(df, outdir, var_thresh=LOW_VARIANCE_THRESHOLD, corr_thresh=CORR_THRESHOLD)
+print("Feature selection complete. Removed:", removed_features)
 
-# VIF (optional, may be heavy)
-vif_df = calculate_vif(df_preprocessed, outdir)
-if vif_df is not None:
-    print("VIF computed for top features. Saved to vif.csv")
+# Preprocess (encode + normalize)
+df_preprocessed, artifact = preprocess_and_save_pipeline(df, outdir)
+print("Preprocessing (encoding + normalization) saved.")
 
-# Save summarised files
-df_preprocessed.shape
-df_preprocessed.to_csv(os.path.join(outdir, "preprocessed_saved.csv"), index=False)
+# Final save
+final_csv = os.path.join(outdir, "final_processed_data.csv")
+df_preprocessed.to_csv(final_csv, index=False)
 
-# Short text summary
-summary_lines = [
-    f"Original shape: {df.shape}",
-    f"After dedupe ({dedup_method}): {df_deduped.shape}, rows_removed: {int(n_removed)}",
-    f"Preprocessed shape (with new transformed cols): {df_preprocessed.shape}",
-    f"Numeric columns transformed (minmax + zscore): {preprocess_artifact.get('numeric_columns')}",
-    f"Categorical columns encoded: {preprocess_artifact.get('categorical_columns')}"
-]
-with open(os.path.join(outdir, "summary.txt"), "w") as f:
-    f.write("\n".join(map(str, summary_lines)))
-print("\n".join(summary_lines))
+# Summary file
+summary = {
+    "initial_shape": None,
+    "after_dedup_removed": int(dedup_removed),
+    "after_nulls_cols_dropped": cols_dropped_missing,
+    "after_nulls_rows_dropped": int(rows_dropped_missing),
+    "outliers_removed": int(outliers_removed),
+    "removed_features": removed_features,
+    "final_shape": list(df_preprocessed.shape),
+    "detected_special_columns": {"date": date_cols, "time": time_cols, "email": email_cols},
+    "special_issues": special_issues
+}
+summary["initial_shape"] = list(pd.read_csv(os.path.join(outdir, "head_before.csv")).shape) if os.path.exists(os.path.join(outdir, "head_before.csv")) else None
+with open(os.path.join(outdir, "summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
 
-# Zip outputs for download
-zip_name = outdir + ".zip"
+# Zip outputs
+zip_path = outdir + ".zip"
 shutil.make_archive(outdir, 'zip', outdir)
-print("\nZipped output to:", zip_name)
 
-# Provide Colab download link
 from IPython.display import HTML, display
-display(HTML(f'<a href="{zip_name}" target="_blank">Download EDA + Preprocessing outputs (zip)</a>'))
+display(HTML(f'<a href="{zip_path}" target="_blank">Download processed data & artifacts (zip)</a>'))
 
-# List top-level files
-print("\nTop-level files created:")
-print(sorted(os.listdir(outdir)))
+print("Done. Final processed CSV:", final_csv)
