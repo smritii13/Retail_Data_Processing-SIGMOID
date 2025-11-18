@@ -7,7 +7,7 @@ Build an automated, reliable data ingestion and quality pipeline that transforms
 **2. Architecture Overview**
 End-to-End Data Flow
 
-Source CSV Files → Raw Landing Zone
+Source CSV Files → Retail_data_source
 
 Ingestion Layer (Python ETL) → raw  tables
 
