@@ -1,4 +1,5 @@
 **Retail Data Processing Hackathon — Loyalty Lens Use Case**
+
 **1. Vision**
 
 Build an automated, reliable data ingestion and quality pipeline that transforms raw retail transactions into clean analytical tables enabling loyalty point accrual, RFM segmentation, High-Spender / At-Risk detection, and CLV Potential scoring.
